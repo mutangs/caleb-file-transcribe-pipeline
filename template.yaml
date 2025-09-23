@@ -1,0 +1,269 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Caleb SQS-only Transcribe pipeline (eu-west-3)
+
+Globals:
+  Function:
+    Runtime: python3.11
+    Timeout: 600
+    MemorySize: 2048
+    Architectures: [x86_64]
+    Environment:
+      Variables:
+        AWS_REGION: eu-west-3
+  Api:
+    EndpointConfiguration: REGIONAL
+
+Resources:
+
+  ### Buckets
+  RawBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: media-raw-caleb
+
+  AudioBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: media-audio-caleb
+
+  TranscriptsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: media-transcripts-caleb
+
+  ### SQS Queues + DLQs
+  RawDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: q-raw-caleb-dlq
+
+  RawQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: q-raw-caleb
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt RawDLQ.Arn
+        maxReceiveCount: 8
+      VisibilityTimeout: 900  # > convert lambda timeout
+
+  AudioDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: q-audio-caleb-dlq
+
+  AudioQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: q-audio-caleb
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt AudioDLQ.Arn
+        maxReceiveCount: 8
+      VisibilityTimeout: 300
+
+  TranscriptsDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: q-transcripts-caleb-dlq
+
+  TranscriptsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: q-transcripts-caleb
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt TranscriptsDLQ.Arn
+        maxReceiveCount: 8
+      VisibilityTimeout: 300
+
+  ### Allow S3 to send notifications to SQS
+  RawQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [ !Ref RawQueue ]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowS3RawToSend
+            Effect: Allow
+            Principal: { Service: s3.amazonaws.com }
+            Action: SQS:SendMessage
+            Resource: !GetAtt RawQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt RawBucket.Arn
+
+  AudioQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [ !Ref AudioQueue ]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowS3AudioToSend
+            Effect: Allow
+            Principal: { Service: s3.amazonaws.com }
+            Action: SQS:SendMessage
+            Resource: !GetAtt AudioQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt AudioBucket.Arn
+
+  TranscriptsQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [ !Ref TranscriptsQueue ]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowS3TranscriptsToSend
+            Effect: Allow
+            Principal: { Service: s3.amazonaws.com }
+            Action: SQS:SendMessage
+            Resource: !GetAtt TranscriptsQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt TranscriptsBucket.Arn
+
+  ### S3 -> SQS Notifications
+  RawBucketNotification:
+    Type: AWS::S3::BucketNotification
+    DependsOn: RawQueuePolicy
+    Properties:
+      Bucket: !Ref RawBucket
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: s3:ObjectCreated:Put
+            Queue: !GetAtt RawQueue.Arn
+
+  AudioBucketNotification:
+    Type: AWS::S3::BucketNotification
+    DependsOn: AudioQueuePolicy
+    Properties:
+      Bucket: !Ref AudioBucket
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: s3:ObjectCreated:Put
+            Queue: !GetAtt AudioQueue.Arn
+
+  TranscriptsBucketNotification:
+    Type: AWS::S3::BucketNotification
+    DependsOn: TranscriptsQueuePolicy
+    Properties:
+      Bucket: !Ref TranscriptsBucket
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: s3:ObjectCreated:Put
+            Queue: !GetAtt TranscriptsQueue.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: raw/
+
+  ### FFmpeg Layer (you must place static ffmpeg in layer/bin/ffmpeg before build)
+  FFmpegLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: ffmpeg-static-caleb
+      ContentUri: layer/
+      CompatibleRuntimes: [python3.11]
+      RetentionPolicy: Retain
+
+  ### Lambda #1: convert_on_upload
+  ConvertFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: convert_on_upload_caleb
+      CodeUri: src/convert_on_upload/
+      Handler: app.handler
+      Layers: [ !Ref FFmpegLayer ]
+      Timeout: 600
+      MemorySize: 3072
+      EphemeralStorage:
+        Size: 4096
+      Environment:
+        Variables:
+          OUTPUT_BUCKET: !Ref AudioBucket
+          FFMPEG_PATH: /opt/bin/ffmpeg
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [ 's3:GetObject' ]
+              Resource: !Sub 'arn:aws:s3:::${RawBucket}/*'
+            - Effect: Allow
+              Action: [ 's3:PutObject','s3:HeadObject','s3:GetObject' ]
+              Resource: !Sub 'arn:aws:s3:::${AudioBucket}/*'
+      Events:
+        RawQueueEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt RawQueue.Arn
+            BatchSize: 1
+            MaximumBatchingWindowInSeconds: 0
+
+  ### Lambda #2: start_transcribe_on_audio
+  StartTranscribeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: start_transcribe_on_audio_caleb
+      CodeUri: src/start_transcribe_on_audio/
+      Handler: app.handler
+      Timeout: 180
+      Environment:
+        Variables:
+          RESULT_BUCKET: !Ref TranscriptsBucket
+          RAW_PREFIX: raw/
+          LANG_OPTIONS: en-US,en-GB,fr-FR,fr-CA
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [ 'transcribe:StartTranscriptionJob','transcribe:GetTranscriptionJob' ]
+              Resource: '*'
+            - Effect: Allow
+              Action: [ 's3:PutObject' ]
+              Resource: !Sub 'arn:aws:s3:::${TranscriptsBucket}/*'
+      Events:
+        AudioQueueEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt AudioQueue.Arn
+            BatchSize: 1
+            MaximumBatchingWindowInSeconds: 0
+
+  ### Lambda #3: finalize_to_text
+  FinalizeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: finalize_to_text_caleb
+      CodeUri: src/finalize_to_text/
+      Handler: app.handler
+      Timeout: 180
+      Environment:
+        Variables:
+          RESULT_BUCKET: !Ref TranscriptsBucket
+          RAW_PREFIX: raw/
+          FINAL_PREFIX: final/
+          DELETE_JSON: true
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [ 's3:GetObject' ]
+              Resource: !Sub 'arn:aws:s3:::${TranscriptsBucket}/raw/*'
+            - Effect: Allow
+              Action: [ 's3:PutObject','s3:DeleteObject' ]
+              Resource: !Sub 'arn:aws:s3:::${TranscriptsBucket}/*'
+      Events:
+        TranscriptsQueueEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt TranscriptsQueue.Arn
+            BatchSize: 1
+            MaximumBatchingWindowInSeconds: 0
+
+Outputs:
+  RawBucketName:
+    Value: !Ref RawBucket
+  AudioBucketName:
+    Value: !Ref AudioBucket
+  TranscriptsBucketName:
+    Value: !Ref TranscriptsBucket
