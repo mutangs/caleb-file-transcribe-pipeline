@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
-Description: Caleb SQS-only Transcribe pipeline (eu-west-3 / Paris)
+Description: Caleb SQS-only Transcribe pipeline using EXISTING S3 buckets (eu-west-3 / Paris)
 
 Globals:
   Function:
@@ -8,33 +8,21 @@ Globals:
     Timeout: 600
     MemorySize: 2048
     Architectures: [ x86_64 ]
-    Environment:
-      Variables:
-        AWS_REGION: eu-west-3
+
+Parameters:
+  RawBucketName:
+    Type: String
+    Description: Existing S3 bucket for raw uploads (e.g., media-raw-caleb)
+  AudioBucketName:
+    Type: String
+    Description: Existing S3 bucket for normalized audio (e.g., media-audio-caleb)
+  TranscriptsBucketName:
+    Type: String
+    Description: Existing S3 bucket for transcripts (e.g., media-transcripts-caleb)
 
 Resources:
 
-  # --------------------
-  # S3 BUCKETS
-  # --------------------
-  RawBucket:
-    Type: AWS::S3::Bucket
-    Properties:
-      BucketName: media-raw-caleb
-
-  AudioBucket:
-    Type: AWS::S3::Bucket
-    Properties:
-      BucketName: media-audio-caleb
-
-  TranscriptsBucket:
-    Type: AWS::S3::Bucket
-    Properties:
-      BucketName: media-transcripts-caleb
-
-  # --------------------
-  # SQS QUEUES + DLQs
-  # --------------------
+  # SQS queues + DLQs
   RawDLQ:
     Type: AWS::SQS::Queue
     Properties:
@@ -47,7 +35,7 @@ Resources:
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt RawDLQ.Arn
         maxReceiveCount: 8
-      VisibilityTimeout: 900     # > convert lambda timeout
+      VisibilityTimeout: 900
 
   AudioDLQ:
     Type: AWS::SQS::Queue
@@ -77,9 +65,7 @@ Resources:
         maxReceiveCount: 8
       VisibilityTimeout: 300
 
-  # --------------------
-  # SQS QUEUE POLICIES (allow S3 to send notifications)
-  # --------------------
+  # SQS queue policies (allow S3 to send from your existing buckets)
   RawQueuePolicy:
     Type: AWS::SQS::QueuePolicy
     Properties:
@@ -93,8 +79,7 @@ Resources:
             Action: SQS:SendMessage
             Resource: !GetAtt RawQueue.Arn
             Condition:
-              ArnEquals:
-                aws:SourceArn: !GetAtt RawBucket.Arn
+              ArnEquals: { aws:SourceArn: !Sub 'arn:aws:s3:::${RawBucketName}' }
 
   AudioQueuePolicy:
     Type: AWS::SQS::QueuePolicy
@@ -109,8 +94,7 @@ Resources:
             Action: SQS:SendMessage
             Resource: !GetAtt AudioQueue.Arn
             Condition:
-              ArnEquals:
-                aws:SourceArn: !GetAtt AudioBucket.Arn
+              ArnEquals: { aws:SourceArn: !Sub 'arn:aws:s3:::${AudioBucketName}' }
 
   TranscriptsQueuePolicy:
     Type: AWS::SQS::QueuePolicy
@@ -125,50 +109,9 @@ Resources:
             Action: SQS:SendMessage
             Resource: !GetAtt TranscriptsQueue.Arn
             Condition:
-              ArnEquals:
-                aws:SourceArn: !GetAtt TranscriptsBucket.Arn
+              ArnEquals: { aws:SourceArn: !Sub 'arn:aws:s3:::${TranscriptsBucketName}' }
 
-  # --------------------
-  # S3 -> SQS NOTIFICATIONS
-  # --------------------
-  RawBucketNotification:
-    Type: AWS::S3::BucketNotification
-    DependsOn: RawQueuePolicy
-    Properties:
-      Bucket: !Ref RawBucket
-      NotificationConfiguration:
-        QueueConfigurations:
-          - Event: s3:ObjectCreated:Put
-            Queue: !GetAtt RawQueue.Arn
-
-  AudioBucketNotification:
-    Type: AWS::S3::BucketNotification
-    DependsOn: AudioQueuePolicy
-    Properties:
-      Bucket: !Ref AudioBucket
-      NotificationConfiguration:
-        QueueConfigurations:
-          - Event: s3:ObjectCreated:Put
-            Queue: !GetAtt AudioQueue.Arn
-
-  TranscriptsBucketNotification:
-    Type: AWS::S3::BucketNotification
-    DependsOn: TranscriptsQueuePolicy
-    Properties:
-      Bucket: !Ref TranscriptsBucket
-      NotificationConfiguration:
-        QueueConfigurations:
-          - Event: s3:ObjectCreated:Put
-            Queue: !GetAtt TranscriptsQueue.Arn
-            Filter:
-              S3Key:
-                Rules:
-                  - Name: prefix
-                    Value: raw/
-
-  # --------------------
-  # LAMBDA LAYER (FFmpeg)
-  # --------------------
+  # FFmpeg Layer
   FFmpegLayer:
     Type: AWS::Serverless::LayerVersion
     Properties:
@@ -176,13 +119,8 @@ Resources:
       ContentUri: layer/
       CompatibleRuntimes: [ python3.11 ]
       RetentionPolicy: Retain
-    # If you decide to let SAM build the layer in a Linux container using a Makefile, add:
-    # Metadata:
-    #   BuildMethod: makefile
 
-  # --------------------
-  # LAMBDA #1: CONVERTER (SQS <- RAW QUEUE)
-  # --------------------
+  # Lambda #1: converter
   ConvertFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -191,20 +129,20 @@ Resources:
       Handler: app.handler
       Layers: [ !Ref FFmpegLayer ]
       Timeout: 600
-      MemorySize: 3072
+      MemorySize: 3008          # <= fix: 3072 → 3008
       EphemeralStorage: { Size: 4096 }
       Environment:
         Variables:
-          OUTPUT_BUCKET: !Ref AudioBucket
+          OUTPUT_BUCKET: !Ref AudioBucketName
           FFMPEG_PATH: /opt/bin/ffmpeg
       Policies:
         - Statement:
             - Effect: Allow
               Action: [ 's3:GetObject' ]
-              Resource: !Sub 'arn:aws:s3:::${RawBucket}/*'
+              Resource: !Sub 'arn:aws:s3:::${RawBucketName}/*'
             - Effect: Allow
               Action: [ 's3:PutObject','s3:HeadObject','s3:GetObject' ]
-              Resource: !Sub 'arn:aws:s3:::${AudioBucket}/*'
+              Resource: !Sub 'arn:aws:s3:::${AudioBucketName}/*'
       Events:
         RawQueueEvent:
           Type: SQS
@@ -213,9 +151,7 @@ Resources:
             BatchSize: 1
             MaximumBatchingWindowInSeconds: 0
 
-  # --------------------
-  # LAMBDA #2: START TRANSCRIBE (SQS <- AUDIO QUEUE)
-  # --------------------
+  # Lambda #2: start transcribe
   StartTranscribeFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -225,7 +161,7 @@ Resources:
       Timeout: 180
       Environment:
         Variables:
-          RESULT_BUCKET: !Ref TranscriptsBucket
+          RESULT_BUCKET: !Ref TranscriptsBucketName
           RAW_PREFIX: raw/
           LANG_OPTIONS: en-US,en-GB,fr-FR,fr-CA
       Policies:
@@ -235,7 +171,7 @@ Resources:
               Resource: '*'
             - Effect: Allow
               Action: [ 's3:PutObject' ]
-              Resource: !Sub 'arn:aws:s3:::${TranscriptsBucket}/*'
+              Resource: !Sub 'arn:aws:s3:::${TranscriptsBucketName}/*'
       Events:
         AudioQueueEvent:
           Type: SQS
@@ -244,9 +180,7 @@ Resources:
             BatchSize: 1
             MaximumBatchingWindowInSeconds: 0
 
-  # --------------------
-  # LAMBDA #3: FINALIZE TO TEXT (SQS <- TRANSCRIPTS RAW QUEUE)
-  # --------------------
+  # Lambda #3: finalize to text
   FinalizeFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -256,7 +190,7 @@ Resources:
       Timeout: 180
       Environment:
         Variables:
-          RESULT_BUCKET: !Ref TranscriptsBucket
+          RESULT_BUCKET: !Ref TranscriptsBucketName
           RAW_PREFIX: raw/
           FINAL_PREFIX: final/
           DELETE_JSON: true
@@ -264,10 +198,10 @@ Resources:
         - Statement:
             - Effect: Allow
               Action: [ 's3:GetObject' ]
-              Resource: !Sub 'arn:aws:s3:::${TranscriptsBucket}/raw/*'
+              Resource: !Sub 'arn:aws:s3:::${TranscriptsBucketName}/raw/*'
             - Effect: Allow
               Action: [ 's3:PutObject','s3:DeleteObject' ]
-              Resource: !Sub 'arn:aws:s3:::${TranscriptsBucket}/*'
+              Resource: !Sub 'arn:aws:s3:::${TranscriptsBucketName}/*'
       Events:
         TranscriptsQueueEvent:
           Type: SQS
@@ -277,9 +211,9 @@ Resources:
             MaximumBatchingWindowInSeconds: 0
 
 Outputs:
-  RawBucketName:
-    Value: !Ref RawBucket
-  AudioBucketName:
-    Value: !Ref AudioBucket
-  TranscriptsBucketName:
-    Value: !Ref TranscriptsBucket
+  RawQueueArn: { Value: !GetAtt RawQueue.Arn }
+  AudioQueueArn: { Value: !GetAtt AudioQueue.Arn }
+  TranscriptsQueueArn: { Value: !GetAtt TranscriptsQueue.Arn }
+  RawQueueUrl: { Value: !Ref RawQueue }
+  AudioQueueUrl: { Value: !Ref AudioQueue }
+  TranscriptsQueueUrl: { Value: !Ref TranscriptsQueue }
