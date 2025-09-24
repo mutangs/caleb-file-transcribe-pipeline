@@ -1,22 +1,22 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
-Description: Caleb SQS-only Transcribe pipeline (eu-west-3)
+Description: Caleb SQS-only Transcribe pipeline (eu-west-3 / Paris)
 
 Globals:
   Function:
     Runtime: python3.11
     Timeout: 600
     MemorySize: 2048
-    Architectures: [x86_64]
+    Architectures: [ x86_64 ]
     Environment:
       Variables:
         AWS_REGION: eu-west-3
-  Api:
-    EndpointConfiguration: REGIONAL
 
 Resources:
 
-  ### Buckets
+  # --------------------
+  # S3 BUCKETS
+  # --------------------
   RawBucket:
     Type: AWS::S3::Bucket
     Properties:
@@ -32,7 +32,9 @@ Resources:
     Properties:
       BucketName: media-transcripts-caleb
 
-  ### SQS Queues + DLQs
+  # --------------------
+  # SQS QUEUES + DLQs
+  # --------------------
   RawDLQ:
     Type: AWS::SQS::Queue
     Properties:
@@ -45,7 +47,7 @@ Resources:
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt RawDLQ.Arn
         maxReceiveCount: 8
-      VisibilityTimeout: 900  # > convert lambda timeout
+      VisibilityTimeout: 900     # > convert lambda timeout
 
   AudioDLQ:
     Type: AWS::SQS::Queue
@@ -75,7 +77,9 @@ Resources:
         maxReceiveCount: 8
       VisibilityTimeout: 300
 
-  ### Allow S3 to send notifications to SQS
+  # --------------------
+  # SQS QUEUE POLICIES (allow S3 to send notifications)
+  # --------------------
   RawQueuePolicy:
     Type: AWS::SQS::QueuePolicy
     Properties:
@@ -124,7 +128,9 @@ Resources:
               ArnEquals:
                 aws:SourceArn: !GetAtt TranscriptsBucket.Arn
 
-  ### S3 -> SQS Notifications
+  # --------------------
+  # S3 -> SQS NOTIFICATIONS
+  # --------------------
   RawBucketNotification:
     Type: AWS::S3::BucketNotification
     DependsOn: RawQueuePolicy
@@ -160,16 +166,23 @@ Resources:
                   - Name: prefix
                     Value: raw/
 
-  ### FFmpeg Layer (you must place static ffmpeg in layer/bin/ffmpeg before build)
+  # --------------------
+  # LAMBDA LAYER (FFmpeg)
+  # --------------------
   FFmpegLayer:
     Type: AWS::Serverless::LayerVersion
     Properties:
       LayerName: ffmpeg-static-caleb
       ContentUri: layer/
-      CompatibleRuntimes: [python3.11]
+      CompatibleRuntimes: [ python3.11 ]
       RetentionPolicy: Retain
+    # If you decide to let SAM build the layer in a Linux container using a Makefile, add:
+    # Metadata:
+    #   BuildMethod: makefile
 
-  ### Lambda #1: convert_on_upload
+  # --------------------
+  # LAMBDA #1: CONVERTER (SQS <- RAW QUEUE)
+  # --------------------
   ConvertFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -179,8 +192,7 @@ Resources:
       Layers: [ !Ref FFmpegLayer ]
       Timeout: 600
       MemorySize: 3072
-      EphemeralStorage:
-        Size: 4096
+      EphemeralStorage: { Size: 4096 }
       Environment:
         Variables:
           OUTPUT_BUCKET: !Ref AudioBucket
@@ -201,7 +213,9 @@ Resources:
             BatchSize: 1
             MaximumBatchingWindowInSeconds: 0
 
-  ### Lambda #2: start_transcribe_on_audio
+  # --------------------
+  # LAMBDA #2: START TRANSCRIBE (SQS <- AUDIO QUEUE)
+  # --------------------
   StartTranscribeFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -230,7 +244,9 @@ Resources:
             BatchSize: 1
             MaximumBatchingWindowInSeconds: 0
 
-  ### Lambda #3: finalize_to_text
+  # --------------------
+  # LAMBDA #3: FINALIZE TO TEXT (SQS <- TRANSCRIPTS RAW QUEUE)
+  # --------------------
   FinalizeFunction:
     Type: AWS::Serverless::Function
     Properties:
